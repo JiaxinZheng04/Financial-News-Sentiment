@@ -1,49 +1,76 @@
 import time
+import torch
 import streamlit as st
-from transformers import pipeline
+from transformers import (
+    pipeline,
+    AutoTokenizer,
+    AutoModelForSequenceClassification
+)
 
 
 # ==================================================
 # Page Configuration
 # ==================================================
 st.set_page_config(
-    page_title="Financial News Sentiment and Risk Summary Tool",
+    page_title="Financial News Risk Screening Tool",
     page_icon="📈",
     layout="wide"
 )
 
 
 # ==================================================
+# Constants
+# ==================================================
+SENTIMENT_MODEL_NAME = "Xinn94L/fiqa-financial-sentiment-distilbert"
+SUMMARY_MODEL_NAME = "t5-small"
+
+
+# ==================================================
 # Model Loading
 # ==================================================
 @st.cache_resource
-def load_sentiment_model():
+def load_sentiment_resources():
     """
-    Load the fine-tuned DistilBERT sentiment classification model.
+    Load the fine-tuned DistilBERT sentiment model.
+
+    The app first tries to use Hugging Face's text-classification pipeline.
+    If the pipeline fails on Streamlit Cloud, the app falls back to manual
+    tokenizer + model inference so that deployment remains stable.
     """
-    return pipeline(
-        task="text-classification",
-        model="Xinn94L/fiqa-financial-sentiment-distilbert",
-        tokenizer="Xinn94L/fiqa-financial-sentiment-distilbert"
-    )
+    tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_NAME)
+    model.eval()
+
+    sentiment_pipe = None
+
+    try:
+        sentiment_pipe = pipeline(
+            task="text-classification",
+            model=model,
+            tokenizer=tokenizer,
+            device=-1
+        )
+    except Exception:
+        sentiment_pipe = None
+
+    return tokenizer, model, sentiment_pipe
 
 
 @st.cache_resource
-def load_summary_model():
+def load_summary_pipeline():
     """
-    Load a lightweight text-to-text generation model for summarization.
-    This uses text2text-generation instead of summarization to avoid
-    Streamlit Cloud task compatibility issues.
+    Load T5-small as a text2text-generation pipeline.
+    This is used as the second Hugging Face pipeline in the app.
     """
     return pipeline(
         task="text2text-generation",
-        model="t5-small",
-        tokenizer="t5-small"
+        model=SUMMARY_MODEL_NAME,
+        tokenizer=SUMMARY_MODEL_NAME,
+        device=-1
     )
 
 
-# Load sentiment model at startup
-classifier = load_sentiment_model()
+sentiment_tokenizer, sentiment_model, sentiment_pipeline = load_sentiment_resources()
 
 
 # ==================================================
@@ -51,53 +78,106 @@ classifier = load_sentiment_model()
 # ==================================================
 def build_model_input(headline: str, target: str, aspect: str) -> str:
     """
-    Keep the app input format consistent with the model training format.
+    Keep the inference format consistent with the training format.
     """
     return f"Headline: {headline} Target: {target} Aspect: {aspect}"
 
 
-def generate_summary(text: str) -> tuple[str, float]:
+def manual_sentiment_inference(text: str) -> dict:
     """
-    Generate a concise summary using T5 text2text-generation.
-    Returns summary text and runtime.
+    Manual model inference used as fallback if the Hugging Face pipeline fails.
+    """
+    inputs = sentiment_tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding=True,
+        max_length=512
+    )
+
+    with torch.no_grad():
+        outputs = sentiment_model(**inputs)
+        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        predicted_id = int(torch.argmax(probabilities, dim=-1).item())
+        confidence = float(probabilities[0][predicted_id].item())
+
+    label = sentiment_model.config.id2label.get(
+        predicted_id,
+        f"LABEL_{predicted_id}"
+    )
+
+    return {
+        "label": label.upper(),
+        "score": confidence,
+        "method": "Manual model inference fallback"
+    }
+
+
+def predict_sentiment(text: str) -> dict:
+    """
+    Predict sentiment using Hugging Face pipeline first.
+    If it fails, use manual inference to avoid app crash.
+    """
+    if sentiment_pipeline is not None:
+        try:
+            result = sentiment_pipeline(text)[0]
+            return {
+                "label": result["label"].upper(),
+                "score": float(result["score"]),
+                "method": "Hugging Face text-classification pipeline"
+            }
+        except Exception:
+            return manual_sentiment_inference(text)
+
+    return manual_sentiment_inference(text)
+
+
+def generate_summary(text: str) -> tuple[str, float, str]:
+    """
+    Generate a short summary using T5 text2text-generation pipeline.
     """
     start_time = time.time()
 
-    if len(text.split()) < 15:
-        runtime = time.time() - start_time
-        return "The input is relatively short, so no additional summary is required.", runtime
-
     try:
-        summarizer = load_summary_model()
+        summary_pipeline = load_summary_pipeline()
+
         prompt = "summarize: " + text
 
-        result = summarizer(
+        result = summary_pipeline(
             prompt,
             max_length=60,
-            min_length=10,
-            do_sample=False
+            min_length=8,
+            do_sample=False,
+            truncation=True
         )
 
-        summary = result[0]["generated_text"]
+        summary = result[0]["generated_text"].strip()
         runtime = time.time() - start_time
-        return summary, runtime
+
+        if not summary:
+            summary = "The input is brief, so the original headline already functions as a concise summary."
+
+        return summary, runtime, "Hugging Face text2text-generation pipeline"
 
     except Exception as error:
         runtime = time.time() - start_time
-        return f"Summary generation is currently unavailable. Error: {str(error)}", runtime
+        fallback_summary = (
+            "Summary generation is currently unavailable. "
+            "The original news text can be reviewed directly."
+        )
+        return fallback_summary, runtime, f"Fallback used due to error: {str(error)}"
 
 
 def generate_risk_note(label: str, confidence: float, aspect: str) -> str:
     """
-    Generate a simple risk note based on the sentiment result.
-    This is not investment advice. It is only an explanatory business-facing output.
+    Generate a business-facing risk note based on the sentiment output.
     """
     label = label.upper()
 
     if confidence < 0.5:
         return (
-            "The model confidence is relatively low. Manual review is recommended before "
-            "using this result for financial interpretation."
+            "The model confidence is relatively low. Manual review is recommended "
+            "before using this result for financial interpretation."
         )
 
     if label == "NEGATIVE":
@@ -110,7 +190,7 @@ def generate_risk_note(label: str, confidence: float, aspect: str) -> str:
     if label == "POSITIVE":
         return (
             f"This news may indicate positive market sentiment related to {aspect}. "
-            "Users may monitor whether this signal is supported by company fundamentals, "
+            "Users may monitor whether the positive signal is supported by fundamentals, "
             "future guidance, or broader market conditions."
         )
 
@@ -121,9 +201,6 @@ def generate_risk_note(label: str, confidence: float, aspect: str) -> str:
 
 
 def format_sentiment_label(label: str) -> str:
-    """
-    Add visual indicator to sentiment label.
-    """
     label = label.upper()
 
     if label == "POSITIVE":
@@ -133,19 +210,50 @@ def format_sentiment_label(label: str) -> str:
     return "🟡 NEUTRAL"
 
 
+def get_example_data():
+    return {
+        "Positive earnings news": {
+            "headline": "Apple reported stronger-than-expected quarterly earnings and raised its revenue guidance.",
+            "target": "Apple",
+            "aspect": "earnings and revenue guidance"
+        },
+        "Negative earnings news": {
+            "headline": "Tesla shares fell after the company missed earnings expectations.",
+            "target": "Tesla",
+            "aspect": "earnings performance"
+        },
+        "Neutral governance news": {
+            "headline": "The company announced a new board appointment on Monday.",
+            "target": "The company",
+            "aspect": "corporate governance"
+        },
+        "Forecast risk news": {
+            "headline": "The retailer cut its annual forecast due to weak consumer spending.",
+            "target": "The retailer",
+            "aspect": "annual forecast"
+        },
+        "Regulatory risk news": {
+            "headline": "The company faces a regulatory investigation over data privacy issues.",
+            "target": "The company",
+            "aspect": "regulatory investigation"
+        }
+    }
+
+
 # ==================================================
-# Main App Interface
+# Main Interface
 # ==================================================
-st.title("📈 Financial News Sentiment and Risk Summary Tool")
+st.title("📈 Financial News Risk Screening Tool")
 
 st.write(
-    "This application helps users screen financial news by classifying market sentiment "
-    "and generating a concise risk note using Hugging Face deep learning models."
+    "A deep-learning-based prototype for screening financial news sentiment "
+    "and generating concise risk summaries for digital brokerage or wealth management users."
 )
 
 st.info(
-    "Pipeline 1: Fine-tuned DistilBERT sentiment classifier  \n"
-    "Pipeline 2: T5 text-to-text generation model for short summary generation"
+    "**Final application structure:**  \n"
+    "Pipeline 1: Financial sentiment classification using a fine-tuned DistilBERT model  \n"
+    "Pipeline 2: Financial news summarization using a T5 text-to-text generation model"
 )
 
 
@@ -156,15 +264,19 @@ with st.sidebar:
     st.header("About This App")
 
     st.write(
-        "This prototype is designed for a digital brokerage or wealth management context, "
-        "where users need to quickly screen financial news and identify possible risk signals."
+        "This prototype is designed for a digital brokerage or wealth management context. "
+        "It helps users quickly screen financial news and identify possible risk signals."
     )
 
-    st.markdown("**Sentiment model:**")
-    st.code("Xinn94L/fiqa-financial-sentiment-distilbert")
+    st.markdown("### Final Deployed Pipelines")
+    st.markdown("**Pipeline 1:** Sentiment Classification")
+    st.code(SENTIMENT_MODEL_NAME)
 
-    st.markdown("**Summary model:**")
-    st.code("t5-small")
+    st.markdown("**Pipeline 2:** Text-to-Text Summary Generation")
+    st.code(SUMMARY_MODEL_NAME)
+
+    st.markdown("### Models Explored")
+    st.write("BERT, FinBERT, and DistilBERT were compared during model selection.")
 
     st.warning(
         "Disclaimer: This tool is for information screening only. "
@@ -175,21 +287,40 @@ with st.sidebar:
 # ==================================================
 # Tabs
 # ==================================================
-tab1, tab2 = st.tabs(["Single News Analysis", "Example Inputs"])
+tab1, tab2, tab3 = st.tabs(
+    ["Analyze News", "Model Design", "Example Inputs"]
+)
 
 
 # ==================================================
-# Tab 1: Single News Analysis
+# Tab 1: Analyze News
 # ==================================================
 with tab1:
     st.subheader("Enter Financial News Information")
+
+    examples = get_example_data()
+
+    selected_example = st.selectbox(
+        "Optional: load a sample input",
+        ["Custom input"] + list(examples.keys())
+    )
+
+    if selected_example != "Custom input":
+        default_headline = examples[selected_example]["headline"]
+        default_target = examples[selected_example]["target"]
+        default_aspect = examples[selected_example]["aspect"]
+    else:
+        default_headline = ""
+        default_target = ""
+        default_aspect = ""
 
     col1, col2 = st.columns([2, 1])
 
     with col1:
         headline = st.text_area(
             "Headline or news text",
-            height=180,
+            value=default_headline,
+            height=170,
             placeholder=(
                 "Example: Apple reported stronger-than-expected quarterly earnings "
                 "and raised its revenue guidance."
@@ -199,11 +330,13 @@ with tab1:
     with col2:
         target = st.text_input(
             "Target company / asset",
+            value=default_target,
             placeholder="Example: Apple"
         )
 
         aspect = st.text_input(
             "Aspect",
+            value=default_aspect,
             placeholder="Example: earnings, revenue guidance, regulation"
         )
 
@@ -219,31 +352,20 @@ with tab1:
         else:
             model_input = build_model_input(headline, target, aspect)
 
-            # ------------------------------
-            # Sentiment classification
-            # ------------------------------
             with st.spinner("Running sentiment classification..."):
                 sentiment_start = time.time()
-                sentiment_result = classifier(model_input)[0]
+                sentiment_result = predict_sentiment(model_input)
                 sentiment_runtime = time.time() - sentiment_start
 
             label = sentiment_result["label"]
-            confidence = float(sentiment_result["score"])
+            confidence = sentiment_result["score"]
+            sentiment_method = sentiment_result["method"]
 
-            # ------------------------------
-            # Summary generation
-            # ------------------------------
             with st.spinner("Generating short summary..."):
-                summary, summary_runtime = generate_summary(headline)
+                summary, summary_runtime, summary_method = generate_summary(headline)
 
-            # ------------------------------
-            # Risk note
-            # ------------------------------
             risk_note = generate_risk_note(label, confidence, aspect)
 
-            # ------------------------------
-            # Display results
-            # ------------------------------
             st.divider()
             st.subheader("Analysis Results")
 
@@ -256,22 +378,31 @@ with tab1:
                 st.metric("Confidence", f"{confidence:.2%}")
 
             with metric_col3:
-                st.metric("Sentiment Runtime", f"{sentiment_runtime:.3f}s")
+                st.metric("Runtime", f"{sentiment_runtime:.3f}s")
 
             if confidence < 0.5:
                 st.warning(
                     "Low-confidence result detected. Manual review is recommended."
                 )
 
-            st.subheader("Short Summary")
+            st.markdown("### Short Summary")
             st.write(summary)
-            st.caption(f"Summary runtime: {summary_runtime:.3f}s")
 
-            st.subheader("Risk Note")
+            st.markdown("### Risk Note")
             st.write(risk_note)
 
-            with st.expander("Show model input format"):
+            with st.expander("Technical Details"):
+                st.markdown("**Model input format:**")
                 st.code(model_input)
+
+                st.markdown("**Sentiment method used:**")
+                st.write(sentiment_method)
+
+                st.markdown("**Summary method used:**")
+                st.write(summary_method)
+
+                st.markdown("**Summary runtime:**")
+                st.write(f"{summary_runtime:.3f}s")
 
             st.caption(
                 "This output is generated for information screening only and should not be interpreted as financial advice."
@@ -279,41 +410,74 @@ with tab1:
 
 
 # ==================================================
-# Tab 2: Example Inputs
+# Tab 2: Model Design
 # ==================================================
 with tab2:
+    st.subheader("Model and Pipeline Design")
+
+    st.markdown(
+        """
+        The project uses a two-pipeline structure for the final Streamlit application:
+
+        **Pipeline 1: Financial Sentiment Classification**  
+        - Task: classify financial news as POSITIVE, NEUTRAL, or NEGATIVE  
+        - Final model: fine-tuned DistilBERT  
+        - Output: sentiment label and confidence score  
+
+        **Pipeline 2: Financial News Summarization**  
+        - Task: generate a concise summary of the input news text  
+        - Model: T5-small text-to-text generation model  
+        - Output: short summary for fast information screening  
+        """
+    )
+
+    st.markdown("### Models Explored During Model Selection")
+
+    model_table = {
+        "Model": ["BERT", "FinBERT", "DistilBERT"],
+        "Purpose": [
+            "Baseline transformer model for text classification",
+            "Finance-domain transformer model",
+            "Lightweight transformer model selected for final deployment"
+        ],
+        "Deployment Status": [
+            "Compared in experiments",
+            "Compared in experiments",
+            "Selected as final sentiment model"
+        ]
+    }
+
+    st.table(model_table)
+
+    st.markdown("### Final Workflow")
+
+    st.code(
+        """
+Financial news input
+        ↓
+Format input as: Headline + Target + Aspect
+        ↓
+Pipeline 1: Fine-tuned DistilBERT sentiment classification
+        ↓
+Sentiment label + confidence score
+        ↓
+Pipeline 2: T5 text-to-text summary generation
+        ↓
+Short summary + business-facing risk note
+        """
+    )
+
+
+# ==================================================
+# Tab 3: Example Inputs
+# ==================================================
+with tab3:
     st.subheader("Sample Financial News Inputs")
 
-    examples = [
-        {
-            "headline": "Apple reported stronger-than-expected quarterly earnings and raised its revenue guidance.",
-            "target": "Apple",
-            "aspect": "earnings and revenue guidance"
-        },
-        {
-            "headline": "Tesla shares fell after the company missed earnings expectations.",
-            "target": "Tesla",
-            "aspect": "earnings performance"
-        },
-        {
-            "headline": "The company announced a new board appointment on Monday.",
-            "target": "The company",
-            "aspect": "corporate governance"
-        },
-        {
-            "headline": "The retailer cut its annual forecast due to weak consumer spending.",
-            "target": "The retailer",
-            "aspect": "annual forecast"
-        },
-        {
-            "headline": "The company faces a regulatory investigation over data privacy issues.",
-            "target": "The company",
-            "aspect": "regulatory investigation"
-        },
-    ]
+    examples = get_example_data()
 
-    for i, example in enumerate(examples, start=1):
-        with st.expander(f"Example {i}"):
+    for title, example in examples.items():
+        with st.expander(title):
             st.markdown("**Headline:**")
             st.write(example["headline"])
 
