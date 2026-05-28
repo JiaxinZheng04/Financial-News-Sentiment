@@ -86,6 +86,7 @@ def build_model_input(headline: str, target: str, aspect: str) -> str:
 def manual_sentiment_inference(text: str) -> dict:
     """
     Manual model inference used as fallback if the Hugging Face pipeline fails.
+    This version removes token_type_ids because DistilBERT does not use them.
     """
     inputs = sentiment_tokenizer(
         text,
@@ -95,16 +96,19 @@ def manual_sentiment_inference(text: str) -> dict:
         max_length=512
     )
 
+    # DistilBERT does not accept token_type_ids.
+    # Some tokenizers may still return it, so remove it before model inference.
+    if "token_type_ids" in inputs:
+        inputs.pop("token_type_ids")
+
     with torch.no_grad():
         outputs = sentiment_model(**inputs)
         probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
         predicted_id = int(torch.argmax(probabilities, dim=-1).item())
         confidence = float(probabilities[0][predicted_id].item())
 
-    label = sentiment_model.config.id2label.get(
-        predicted_id,
-        f"LABEL_{predicted_id}"
-    )
+    id2label = sentiment_model.config.id2label
+    label = id2label.get(predicted_id, f"LABEL_{predicted_id}")
 
     return {
         "label": label.upper(),
