@@ -3,9 +3,9 @@ import streamlit as st
 from transformers import pipeline
 
 
-# --------------------------------------------------
-# Page configuration
-# --------------------------------------------------
+# ==================================================
+# Page Configuration
+# ==================================================
 st.set_page_config(
     page_title="Financial News Sentiment and Risk Summary Tool",
     page_icon="📈",
@@ -13,99 +13,117 @@ st.set_page_config(
 )
 
 
-# --------------------------------------------------
-# Load models
-# --------------------------------------------------
+# ==================================================
+# Model Loading
+# ==================================================
 @st.cache_resource
 def load_sentiment_model():
-    classifier = pipeline(
-        "text-classification",
+    """
+    Load the fine-tuned DistilBERT sentiment classification model.
+    """
+    return pipeline(
+        task="text-classification",
         model="Xinn94L/fiqa-financial-sentiment-distilbert",
         tokenizer="Xinn94L/fiqa-financial-sentiment-distilbert"
     )
-    return classifier
 
 
 @st.cache_resource
-def load_summarization_model():
-    summarizer = pipeline(
-        "summarization",
+def load_summary_model():
+    """
+    Load a lightweight text-to-text generation model for summarization.
+    This uses text2text-generation instead of summarization to avoid
+    Streamlit Cloud task compatibility issues.
+    """
+    return pipeline(
+        task="text2text-generation",
         model="t5-small",
         tokenizer="t5-small"
     )
-    return summarizer
 
 
+# Load sentiment model at startup
 classifier = load_sentiment_model()
-summarizer = load_summarization_model()
 
 
-# --------------------------------------------------
-# Helper functions
-# --------------------------------------------------
-def build_model_input(headline, target, aspect):
+# ==================================================
+# Helper Functions
+# ==================================================
+def build_model_input(headline: str, target: str, aspect: str) -> str:
     """
-    Keep the inference input format consistent with the training format.
+    Keep the app input format consistent with the model training format.
     """
     return f"Headline: {headline} Target: {target} Aspect: {aspect}"
 
 
-def generate_summary(text):
+def generate_summary(text: str) -> tuple[str, float]:
     """
-    Generate a short summary.
-    If the input is too short, return a simple message instead of forcing summarization.
+    Generate a concise summary using T5 text2text-generation.
+    Returns summary text and runtime.
     """
-    word_count = len(text.split())
+    start_time = time.time()
 
-    if word_count < 15:
-        return "The input is relatively short, so no additional summary is required."
+    if len(text.split()) < 15:
+        runtime = time.time() - start_time
+        return "The input is relatively short, so no additional summary is required.", runtime
 
     try:
-        summary = summarizer(
-            text,
+        summarizer = load_summary_model()
+        prompt = "summarize: " + text
+
+        result = summarizer(
+            prompt,
             max_length=60,
             min_length=10,
             do_sample=False
-        )[0]["summary_text"]
-        return summary
-    except Exception:
-        return "Summary generation is currently unavailable for this input."
+        )
+
+        summary = result[0]["generated_text"]
+        runtime = time.time() - start_time
+        return summary, runtime
+
+    except Exception as error:
+        runtime = time.time() - start_time
+        return f"Summary generation is currently unavailable. Error: {str(error)}", runtime
 
 
-def generate_risk_note(label, confidence, aspect):
+def generate_risk_note(label: str, confidence: float, aspect: str) -> str:
     """
-    Generate a simple business-facing risk note based on sentiment output.
-    This is rule-based and used only for explanation, not as investment advice.
+    Generate a simple risk note based on the sentiment result.
+    This is not investment advice. It is only an explanatory business-facing output.
     """
     label = label.upper()
 
     if confidence < 0.5:
         return (
-            "The model confidence is relatively low. This result should be reviewed manually "
-            "before being used for business or investment-related interpretation."
+            "The model confidence is relatively low. Manual review is recommended before "
+            "using this result for financial interpretation."
         )
 
     if label == "NEGATIVE":
         return (
-            f"The news may indicate potential downside risk related to {aspect}. "
-            "Users may need to monitor earnings guidance, regulatory updates, market reaction, "
-            "or company-specific exposure."
+            f"This news may indicate potential downside risk related to {aspect}. "
+            "Users may need to monitor earnings guidance, regulatory developments, "
+            "market reaction, or company-specific exposure."
         )
 
     if label == "POSITIVE":
         return (
-            f"The news may indicate positive market sentiment related to {aspect}. "
-            "Users may monitor whether this signal is supported by fundamentals, future guidance, "
-            "or broader market conditions."
+            f"This news may indicate positive market sentiment related to {aspect}. "
+            "Users may monitor whether this signal is supported by company fundamentals, "
+            "future guidance, or broader market conditions."
         )
 
     return (
-        f"The news appears relatively neutral regarding {aspect}. "
+        f"This news appears relatively neutral regarding {aspect}. "
         "Users may continue monitoring related updates before drawing strong conclusions."
     )
 
 
-def get_sentiment_badge(label):
+def format_sentiment_label(label: str) -> str:
+    """
+    Add visual indicator to sentiment label.
+    """
     label = label.upper()
 
     if label == "POSITIVE":
@@ -115,49 +133,67 @@ def get_sentiment_badge(label):
     return "🟡 NEUTRAL"
 
 
-# --------------------------------------------------
-# Main interface
-# --------------------------------------------------
-st.title("Financial News Sentiment and Risk Summary Tool")
+# ==================================================
+# Main App Interface
+# ==================================================
+st.title("📈 Financial News Sentiment and Risk Summary Tool")
 
 st.write(
     "This application helps users screen financial news by classifying market sentiment "
-    "and generating a concise risk summary using deep learning models."
+    "and generating a concise risk note using Hugging Face deep learning models."
 )
 
 st.info(
-    "Model pipeline: Fine-tuned DistilBERT sentiment classifier + T5 summarization model."
+    "Pipeline 1: Fine-tuned DistilBERT sentiment classifier  \n"
+    "Pipeline 2: T5 text-to-text generation model for short summary generation"
 )
 
+
+# ==================================================
+# Sidebar
+# ==================================================
 with st.sidebar:
-    st.header("About this tool")
+    st.header("About This App")
+
     st.write(
-        "This prototype is designed for financial news screening in a digital brokerage "
-        "or wealth management context."
+        "This prototype is designed for a digital brokerage or wealth management context, "
+        "where users need to quickly screen financial news and identify possible risk signals."
     )
-    st.write("**Sentiment model:** Xinn94L/fiqa-financial-sentiment-distilbert")
-    st.write("**Summary model:** t5-small")
+
+    st.markdown("**Sentiment model:**")
+    st.code("Xinn94L/fiqa-financial-sentiment-distilbert")
+
+    st.markdown("**Summary model:**")
+    st.code("t5-small")
+
     st.warning(
-        "Disclaimer: This tool is for information screening only and does not provide investment advice."
+        "Disclaimer: This tool is for information screening only. "
+        "It does not provide investment advice."
     )
 
 
+# ==================================================
+# Tabs
+# ==================================================
 tab1, tab2 = st.tabs(["Single News Analysis", "Example Inputs"])
 
 
-# --------------------------------------------------
+# ==================================================
 # Tab 1: Single News Analysis
-# --------------------------------------------------
+# ==================================================
 with tab1:
-    st.subheader("Enter financial news information")
+    st.subheader("Enter Financial News Information")
 
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([2, 1])
 
     with col1:
         headline = st.text_area(
             "Headline or news text",
-            height=160,
-            placeholder="Example: Apple reported stronger-than-expected quarterly earnings and raised its revenue guidance."
+            height=180,
+            placeholder=(
+                "Example: Apple reported stronger-than-expected quarterly earnings "
+                "and raised its revenue guidance."
+            )
         )
 
     with col2:
@@ -168,7 +204,7 @@ with tab1:
 
         aspect = st.text_input(
             "Aspect",
-            placeholder="Example: earnings, revenue guidance, regulation, market outlook"
+            placeholder="Example: earnings, revenue guidance, regulation"
         )
 
     analyze_button = st.button("Analyze News", type="primary")
@@ -183,29 +219,38 @@ with tab1:
         else:
             model_input = build_model_input(headline, target, aspect)
 
+            # ------------------------------
+            # Sentiment classification
+            # ------------------------------
             with st.spinner("Running sentiment classification..."):
                 sentiment_start = time.time()
                 sentiment_result = classifier(model_input)[0]
                 sentiment_runtime = time.time() - sentiment_start
 
             label = sentiment_result["label"]
-            confidence = sentiment_result["score"]
+            confidence = float(sentiment_result["score"])
 
+            # ------------------------------
+            # Summary generation
+            # ------------------------------
             with st.spinner("Generating short summary..."):
-                summary_start = time.time()
-                summary = generate_summary(headline)
-                summary_runtime = time.time() - summary_start
+                summary, summary_runtime = generate_summary(headline)
 
+            # ------------------------------
+            # Risk note
+            # ------------------------------
             risk_note = generate_risk_note(label, confidence, aspect)
 
+            # ------------------------------
+            # Display results
+            # ------------------------------
             st.divider()
-
             st.subheader("Analysis Results")
 
             metric_col1, metric_col2, metric_col3 = st.columns(3)
 
             with metric_col1:
-                st.metric("Sentiment", get_sentiment_badge(label))
+                st.metric("Sentiment", format_sentiment_label(label))
 
             with metric_col2:
                 st.metric("Confidence", f"{confidence:.2%}")
@@ -215,12 +260,11 @@ with tab1:
 
             if confidence < 0.5:
                 st.warning(
-                    "Low confidence result. Manual review is recommended before interpretation."
+                    "Low-confidence result detected. Manual review is recommended."
                 )
 
             st.subheader("Short Summary")
             st.write(summary)
-
             st.caption(f"Summary runtime: {summary_runtime:.3f}s")
 
             st.subheader("Risk Note")
@@ -234,11 +278,11 @@ with tab1:
             )
 
 
-# --------------------------------------------------
+# ==================================================
 # Tab 2: Example Inputs
-# --------------------------------------------------
+# ==================================================
 with tab2:
-    st.subheader("Sample financial news inputs")
+    st.subheader("Sample Financial News Inputs")
 
     examples = [
         {
@@ -265,14 +309,21 @@ with tab2:
             "headline": "The company faces a regulatory investigation over data privacy issues.",
             "target": "The company",
             "aspect": "regulatory investigation"
-        }
+        },
     ]
 
     for i, example in enumerate(examples, start=1):
         with st.expander(f"Example {i}"):
-            st.write("**Headline:**", example["headline"])
-            st.write("**Target:**", example["target"])
-            st.write("**Aspect:**", example["aspect"])
+            st.markdown("**Headline:**")
+            st.write(example["headline"])
+
+            st.markdown("**Target:**")
+            st.write(example["target"])
+
+            st.markdown("**Aspect:**")
+            st.write(example["aspect"])
+
+            st.markdown("**Model input format:**")
             st.code(
                 build_model_input(
                     example["headline"],
